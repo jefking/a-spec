@@ -37,7 +37,7 @@ export class ReviewController extends EventEmitter {
   };
   private codex: CodexAppServer | null = null;
   private account: AccountState | null = null;
-  private seedThreadId: string | null = null;
+  private codexReady = false;
   private worktreeWatcher: FSWatcher | null = null;
   private gitWatcher: FSWatcher | null = null;
   private refreshTimer: NodeJS.Timeout | null = null;
@@ -68,7 +68,7 @@ export class ReviewController extends EventEmitter {
     await this.startWatchers(repository);
     const [snapshotResult, codexResult] = await Promise.allSettled([
       captureSnapshot(repository.root),
-      this.connectCodex(repository, generation),
+      this.connectCodex(generation),
     ]);
     if (generation !== this.generation) return;
 
@@ -129,10 +129,7 @@ export class ReviewController extends EventEmitter {
     }
   }
 
-  private async connectCodex(
-    repository: RepositoryInfo,
-    generation: number,
-  ): Promise<void> {
+  private async connectCodex(generation: number): Promise<void> {
     if (!this.codex) {
       const client = new CodexAppServer();
       client.on("notification", (message: AppServerNotification) => {
@@ -147,9 +144,9 @@ export class ReviewController extends EventEmitter {
     }
     if (generation !== this.generation || !this.codex) return;
     this.account = await this.codex.readAccount();
-    if (this.account.account || !this.account.requiresOpenaiAuth) {
-      this.seedThreadId = await this.codex.createSeedThread(repository.root);
-    }
+    this.codexReady = Boolean(
+      this.account.account || !this.account.requiresOpenaiAuth,
+    );
   }
 
   private advanceAfterConnection(initial: boolean) {
@@ -187,8 +184,8 @@ export class ReviewController extends EventEmitter {
     }
     try {
       this.account = await this.codex.readAccount();
-      this.seedThreadId = await this.codex.createSeedThread(
-        this.state.repository.root,
+      this.codexReady = Boolean(
+        this.account.account || !this.account.requiresOpenaiAuth,
       );
       this.advanceAfterConnection(true);
     } catch (error) {
@@ -252,7 +249,7 @@ export class ReviewController extends EventEmitter {
         this.emitState();
         return;
       }
-      if (!this.seedThreadId) {
+      if (!this.codexReady) {
         if (this.account?.requiresOpenaiAuth && !this.account.account) {
           this.state.status = {
             type: "auth-required",
@@ -293,9 +290,8 @@ export class ReviewController extends EventEmitter {
 
   private async runReview(snapshot: SnapshotSummary, generation: number) {
     const repository = this.state.repository;
-    const seedThreadId = this.seedThreadId;
     const codex = this.codex;
-    if (!repository || !seedThreadId || !codex) return;
+    if (!repository || !this.codexReady || !codex) return;
 
     try {
       const latestBeforeStart = await captureSnapshot(repository.root);
@@ -322,7 +318,7 @@ export class ReviewController extends EventEmitter {
       };
       this.emitState();
       const markdown = await codex.reviewUncommittedChanges(
-        seedThreadId,
+        repository.root,
         abortController.signal,
       );
       if (generation !== this.generation || abortController.signal.aborted) return;
@@ -367,7 +363,7 @@ export class ReviewController extends EventEmitter {
 
   private handleCodexExit(error: Error) {
     if (!this.state.repository || this.restarting) return;
-    this.seedThreadId = null;
+    this.codexReady = false;
     this.activeReview?.abort();
     this.activeReview = null;
     this.state.status = { type: "error", message: error.message, recoverable: true };
@@ -388,7 +384,7 @@ export class ReviewController extends EventEmitter {
     this.state.status = { type: "connecting", message: "Reconnecting to Codex…" };
     this.emitState();
     try {
-      await this.connectCodex(this.state.repository, generation);
+      await this.connectCodex(generation);
       if (generation === this.generation) this.advanceAfterConnection(false);
     } catch (error) {
       if (generation === this.generation) this.handleCodexExit(error as Error);
@@ -423,7 +419,7 @@ export class ReviewController extends EventEmitter {
     this.activeReview = null;
     this.pendingSnapshot = null;
     this.lastObservedSnapshotId = null;
-    this.seedThreadId = null;
+    this.codexReady = false;
     await Promise.all([
       this.worktreeWatcher?.close(),
       this.gitWatcher?.close(),

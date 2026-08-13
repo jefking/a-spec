@@ -20,8 +20,14 @@ input.on("line", line => {
   if (!Object.prototype.hasOwnProperty.call(message, "id")) return;
   if (message.method === "initialize") send({ id: message.id, result: { userAgent: "fake", codexHome: "/tmp", platformFamily: "unix", platformOs: "linux" } });
   if (message.method === "account/read") send({ id: message.id, result: { account: { type: "chatgpt", email: "test@example.test", planType: "plus" }, requiresOpenaiAuth: true } });
-  if (message.method === "thread/start") send({ id: message.id, result: { thread: { id: "seed" } } });
-  if (message.method === "thread/fork") send({ id: message.id, result: { thread: { id: "review-thread" } } });
+  if (message.method === "thread/start") {
+    if (message.params.cwd !== "/tmp/repository" || message.params.ephemeral !== true) {
+      send({ id: message.id, error: { code: -32602, message: "review thread must be ephemeral and use the repository cwd" } });
+    } else {
+      send({ id: message.id, result: { thread: { id: "review-thread" } } });
+    }
+  }
+  if (message.method === "thread/fork") send({ id: message.id, error: { code: -32602, message: "ephemeral threads cannot be forked" } });
   if (message.method === "review/start") {
     send({ id: message.id, result: { turn: { id: "turn-1" }, reviewThreadId: "review-thread" } });
     send({ method: "item/completed", params: { threadId: "review-thread", turnId: "turn-1", item: { type: "exitedReviewMode", id: "turn-1", review: "## Review\\n\\nLooks good." } } });
@@ -42,17 +48,18 @@ afterEach(async () => {
 });
 
 describe("Codex app-server client", () => {
-  it("initializes, reads shared auth, creates an ephemeral seed, and receives review Markdown", async () => {
+  it("initializes, reads shared auth, and reviews on a fresh ephemeral thread", async () => {
     const runtime = await fakeCodex();
     const client = new CodexAppServer(() => runtime);
     await client.start();
     await expect(client.readAccount()).resolves.toMatchObject({
       account: { type: "chatgpt" },
     });
-    const seed = await client.createSeedThread("/tmp/repository");
-    expect(seed).toBe("seed");
     await expect(
-      client.reviewUncommittedChanges(seed, new AbortController().signal),
+      client.reviewUncommittedChanges(
+        "/tmp/repository",
+        new AbortController().signal,
+      ),
     ).resolves.toBe("## Review\n\nLooks good.");
     await client.stop();
   });
@@ -64,7 +71,7 @@ describe("Codex app-server client", () => {
     const abort = new AbortController();
     abort.abort();
     await expect(
-      client.reviewUncommittedChanges("seed", abort.signal),
+      client.reviewUncommittedChanges("/tmp/repository", abort.signal),
     ).rejects.toMatchObject({ name: "AbortError" });
     await client.stop();
   });

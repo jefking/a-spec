@@ -191,7 +191,7 @@ export class CodexAppServer extends EventEmitter {
     });
   }
 
-  async createSeedThread(root: string): Promise<string> {
+  private async createReviewThread(root: string): Promise<string> {
     const response = await this.request<ThreadResponse>("thread/start", {
       cwd: root,
       approvalPolicy: "never",
@@ -209,14 +209,16 @@ export class CodexAppServer extends EventEmitter {
   }
 
   async reviewUncommittedChanges(
-    seedThreadId: string,
+    root: string,
     signal: AbortSignal,
   ): Promise<string> {
-    const fork = await this.request<ThreadResponse>("thread/fork", {
-      threadId: seedThreadId,
-      ephemeral: true,
-    });
-    const threadId = fork.thread.id;
+    if (signal.aborted) {
+      throw new DOMException("Review superseded", "AbortError");
+    }
+    const threadId = await this.createReviewThread(root);
+    if (signal.aborted) {
+      throw new DOMException("Review superseded", "AbortError");
+    }
 
     let turnId: string | null = null;
     let finalReview: string | null = null;

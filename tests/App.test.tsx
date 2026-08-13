@@ -71,6 +71,53 @@ describe("A-Spec renderer", () => {
     expect(screen.queryByRole("button", { name: /^review$/i })).not.toBeInTheDocument();
   });
 
+  it("shows the latest completed review at the top of the timeline", () => {
+    const snapshot = {
+      id: "0123456789",
+      branch: "main",
+      head: "abc123",
+      files: [{ path: "src/example.ts", status: ".M" }],
+      fileCount: 1,
+      additions: 2,
+      deletions: 1,
+      capturedAt: "2026-01-01T12:00:00.000Z",
+    };
+    installReviewer({
+      repository: {
+        root: "/work/example",
+        name: "example",
+        branch: "main",
+        head: "abc123",
+      },
+      cadenceMs: 2_000,
+      status: { type: "watching", message: "Watching" },
+      entries: [
+        {
+          id: "review-1",
+          startedAt: "2026-01-01T12:00:00.000Z",
+          completedAt: "2026-01-01T12:00:01.000Z",
+          markdown: "Earlier review",
+          snapshot,
+        },
+        {
+          id: "review-2",
+          startedAt: "2026-01-01T12:01:00.000Z",
+          completedAt: "2026-01-01T12:01:01.000Z",
+          markdown: "Latest review",
+          snapshot,
+        },
+      ],
+    });
+
+    const { container } = render(<App />);
+
+    const cards = container.querySelectorAll("article");
+    expect(cards[0]).toHaveTextContent("REVIEW 02");
+    expect(cards[0]).toHaveTextContent("Latest review");
+    expect(cards[1]).toHaveTextContent("REVIEW 01");
+    expect(cards[1]).toHaveTextContent("Earlier review");
+  });
+
   it("persists only the cadence preference", async () => {
     const api = installReviewer({
       repository: null,

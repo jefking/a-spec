@@ -130,6 +130,15 @@ export function App() {
     () => `${(state.cadenceMs / 1_000).toFixed(1)}s quiet`,
     [state.cadenceMs],
   );
+  const newestEntries = useMemo(
+    () =>
+      [...state.entries].sort(
+        (left, right) =>
+          new Date(right.completedAt).getTime() -
+          new Date(left.completedAt).getTime(),
+      ),
+    [state.entries],
+  );
 
   async function chooseRepository(change = false) {
     setSelectionError(null);
@@ -245,8 +254,12 @@ export function App() {
               <span>{state.entries.length} completed</span>
             </div>
           )}
-          {state.entries.map((entry, index) => (
-            <ReviewCard key={entry.id} entry={entry} sequence={index + 1} />
+          {newestEntries.map((entry, index) => (
+            <ReviewCard
+              key={entry.id}
+              entry={entry}
+              sequence={state.entries.length - index}
+            />
           ))}
           {state.entries.length === 0 && !isAuthRequired && (
             <div className="empty-timeline">
