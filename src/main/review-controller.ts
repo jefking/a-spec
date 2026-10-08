@@ -16,8 +16,10 @@ import {
 import {
   DEFAULT_CADENCE_MS,
   MAX_CADENCE_MS,
+  MAX_QUESTION_LENGTH,
   MIN_CADENCE_MS,
   CADENCE_STEP_MS,
+  type AskQuestionResult,
   type RepositoryInfo,
   type ReviewerState,
   type SnapshotSummary,
@@ -31,6 +33,7 @@ type AppServerNotification = {
 export class ReviewController extends EventEmitter {
   private state: ReviewerState = {
     repository: null,
+    currentSnapshot: null,
     cadenceMs: DEFAULT_CADENCE_MS,
     status: { type: "selecting" },
     entries: [],
@@ -44,6 +47,7 @@ export class ReviewController extends EventEmitter {
   private reviewTimer: NodeJS.Timeout | null = null;
   private pendingSnapshot: SnapshotSummary | null = null;
   private activeReview: AbortController | null = null;
+  private activeQuestion: AbortController | null = null;
   private lastObservedSnapshotId: string | null = null;
   private generation = 0;
   private restartAttempts = 0;
@@ -59,6 +63,7 @@ export class ReviewController extends EventEmitter {
     const generation = ++this.generation;
     this.state = {
       repository,
+      currentSnapshot: null,
       cadenceMs: this.state.cadenceMs,
       status: { type: "connecting", message: "Connecting to Codex…" },
       entries: [],
@@ -74,6 +79,7 @@ export class ReviewController extends EventEmitter {
 
     if (snapshotResult.status === "fulfilled") {
       this.pendingSnapshot = snapshotResult.value;
+      this.state.currentSnapshot = snapshotResult.value;
       this.lastObservedSnapshotId = snapshotResult.value?.id ?? null;
       this.updateRepositoryRevision(snapshotResult.value);
     } else {
@@ -117,6 +123,134 @@ export class ReviewController extends EventEmitter {
     };
     this.emitState();
     return login.authUrl;
+  }
+
+  async askQuestion(question: string): Promise<AskQuestionResult> {
+    const normalizedQuestion = question.trim();
+    if (!normalizedQuestion) {
+      return { ok: false, message: "Enter a question first." };
+    }
+    if (normalizedQuestion.length > MAX_QUESTION_LENGTH) {
+      return {
+        ok: false,
+        message: `Questions can be at most ${MAX_QUESTION_LENGTH.toLocaleString()} characters.`,
+      };
+    }
+
+    const repository = this.state.repository;
+    const codex = this.codex;
+    if (!repository) {
+      return { ok: false, message: "Choose a repository first." };
+    }
+    if (!this.codexReady || !codex) {
+      return { ok: false, message: "Codex is not ready yet." };
+    }
+    if (this.activeReview || this.activeQuestion) {
+      return { ok: false, message: "Wait for the current Codex request to finish." };
+    }
+
+    const generation = this.generation;
+    const resumePendingReview = this.reviewTimer !== null;
+    let questionRequest: AbortController | null = null;
+    this.cancelPendingReview();
+
+    try {
+      const snapshot = await captureSnapshot(repository.root);
+      if (generation !== this.generation) {
+        return { ok: false, message: "The selected repository changed." };
+      }
+      this.pendingSnapshot = snapshot;
+      this.state.currentSnapshot = snapshot;
+      this.lastObservedSnapshotId = snapshot?.id ?? null;
+      this.updateRepositoryRevision(snapshot);
+      if (!snapshot) {
+        this.state.status = {
+          type: "clean",
+          message: "Working tree clean — make a change before asking a question.",
+        };
+        this.emitState();
+        return { ok: false, message: "There are no current changes to ask about." };
+      }
+
+      const abortController = new AbortController();
+      questionRequest = abortController;
+      this.activeQuestion = abortController;
+      const startedAt = new Date().toISOString();
+      this.state.status = {
+        type: "answering",
+        message: "Codex is answering your question about this snapshot…",
+        snapshot,
+      };
+      this.emitState();
+
+      const markdown = await codex.answerQuestion(
+        repository.root,
+        normalizedQuestion,
+        abortController.signal,
+      );
+      if (generation !== this.generation || abortController.signal.aborted) {
+        return { ok: false, message: "The question was superseded by newer changes." };
+      }
+
+      const latestSnapshot = await captureSnapshot(repository.root);
+      if (!latestSnapshot || latestSnapshot.id !== snapshot.id) {
+        this.pendingSnapshot = latestSnapshot;
+        this.state.currentSnapshot = latestSnapshot;
+        this.lastObservedSnapshotId = latestSnapshot?.id ?? null;
+        this.updateRepositoryRevision(latestSnapshot);
+        if (latestSnapshot) {
+          this.scheduleReview(latestSnapshot, false);
+        } else {
+          this.state.status = {
+            type: "clean",
+            message: "Working tree clean — watching.",
+          };
+          this.emitState();
+        }
+        return {
+          ok: false,
+          message: "The changes moved while Codex was answering. Ask again for the latest snapshot.",
+        };
+      }
+
+      this.state.entries.push({
+        id: randomUUID(),
+        kind: "answer",
+        question: normalizedQuestion,
+        snapshot,
+        startedAt,
+        completedAt: new Date().toISOString(),
+        markdown,
+      });
+      this.pendingSnapshot = latestSnapshot;
+      this.state.currentSnapshot = latestSnapshot;
+      if (resumePendingReview) {
+        this.scheduleReview(latestSnapshot, false);
+      } else {
+        this.state.status = {
+          type: "watching",
+          message: "Answer complete — watching for changes.",
+        };
+        this.emitState();
+      }
+      return { ok: true };
+    } catch (error) {
+      if ((error as Error).name === "AbortError") {
+        return { ok: false, message: "The question was superseded by newer changes." };
+      }
+      if (generation === this.generation) this.setFailure(error);
+      return {
+        ok: false,
+        message: error instanceof Error ? error.message : String(error),
+      };
+    } finally {
+      if (
+        generation === this.generation &&
+        this.activeQuestion === questionRequest
+      ) {
+        this.activeQuestion = null;
+      }
+    }
   }
 
   async dispose(): Promise<void> {
@@ -232,6 +366,7 @@ export class ReviewController extends EventEmitter {
     try {
       const snapshot = await captureSnapshot(repository.root);
       if (generation !== this.generation) return;
+      this.state.currentSnapshot = snapshot;
       this.updateRepositoryRevision(snapshot);
       const snapshotId = snapshot?.id ?? null;
       if (snapshotId === this.lastObservedSnapshotId) return;
@@ -240,6 +375,8 @@ export class ReviewController extends EventEmitter {
       this.cancelPendingReview();
       this.activeReview?.abort();
       this.activeReview = null;
+      this.activeQuestion?.abort();
+      this.activeQuestion = null;
 
       if (!snapshot) {
         this.state.status = {
@@ -292,6 +429,7 @@ export class ReviewController extends EventEmitter {
     const repository = this.state.repository;
     const codex = this.codex;
     if (!repository || !this.codexReady || !codex) return;
+    let reviewRequest: AbortController | null = null;
 
     try {
       const latestBeforeStart = await captureSnapshot(repository.root);
@@ -302,6 +440,7 @@ export class ReviewController extends EventEmitter {
       ) {
         if (generation === this.generation) {
           this.pendingSnapshot = latestBeforeStart;
+          this.state.currentSnapshot = latestBeforeStart;
           this.lastObservedSnapshotId = latestBeforeStart?.id ?? null;
           if (latestBeforeStart) this.scheduleReview(latestBeforeStart, false);
         }
@@ -309,6 +448,7 @@ export class ReviewController extends EventEmitter {
       }
 
       const abortController = new AbortController();
+      reviewRequest = abortController;
       this.activeReview = abortController;
       const startedAt = new Date().toISOString();
       this.state.status = {
@@ -326,6 +466,7 @@ export class ReviewController extends EventEmitter {
       const latestAfterReview = await captureSnapshot(repository.root);
       if (!latestAfterReview || latestAfterReview.id !== snapshot.id) {
         this.pendingSnapshot = latestAfterReview;
+        this.state.currentSnapshot = latestAfterReview;
         this.lastObservedSnapshotId = latestAfterReview?.id ?? null;
         if (latestAfterReview) this.scheduleReview(latestAfterReview, false);
         return;
@@ -333,12 +474,14 @@ export class ReviewController extends EventEmitter {
 
       this.state.entries.push({
         id: randomUUID(),
+        kind: "review",
         snapshot,
         startedAt,
         completedAt: new Date().toISOString(),
         markdown,
       });
       this.pendingSnapshot = snapshot;
+      this.state.currentSnapshot = snapshot;
       this.state.status = {
         type: "watching",
         message: "Review complete — watching for changes.",
@@ -348,7 +491,9 @@ export class ReviewController extends EventEmitter {
       if ((error as Error).name === "AbortError") return;
       if (generation === this.generation) this.setFailure(error);
     } finally {
-      if (generation === this.generation) this.activeReview = null;
+      if (generation === this.generation && this.activeReview === reviewRequest) {
+        this.activeReview = null;
+      }
     }
   }
 
@@ -366,6 +511,8 @@ export class ReviewController extends EventEmitter {
     this.codexReady = false;
     this.activeReview?.abort();
     this.activeReview = null;
+    this.activeQuestion?.abort();
+    this.activeQuestion = null;
     this.state.status = { type: "error", message: error.message, recoverable: true };
     this.emitState();
     if (this.restartAttempts >= 3) return;
@@ -417,7 +564,10 @@ export class ReviewController extends EventEmitter {
     this.refreshTimer = null;
     this.activeReview?.abort();
     this.activeReview = null;
+    this.activeQuestion?.abort();
+    this.activeQuestion = null;
     this.pendingSnapshot = null;
+    this.state.currentSnapshot = null;
     this.lastObservedSnapshotId = null;
     this.codexReady = false;
     await Promise.all([

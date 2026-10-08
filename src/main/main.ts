@@ -2,7 +2,11 @@ import { app, BrowserWindow, dialog, ipcMain, shell } from "electron";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { ReviewController } from "./review-controller";
-import type { SelectRepositoryResult, StartLoginResult } from "../shared/types";
+import type {
+  AskQuestionResult,
+  SelectRepositoryResult,
+  StartLoginResult,
+} from "../shared/types";
 
 const currentDirectory = dirname(fileURLToPath(import.meta.url));
 const controller = new ReviewController();
@@ -62,6 +66,15 @@ function registerIpc() {
     }
     return controller.setCadence(milliseconds);
   });
+  ipcMain.handle(
+    "reviewer:ask-question",
+    (_event, question: unknown): Promise<AskQuestionResult> => {
+      if (typeof question !== "string") {
+        return Promise.resolve({ ok: false, message: "Question must be text." });
+      }
+      return controller.askQuestion(question);
+    },
+  );
   ipcMain.handle("reviewer:start-login", async (): Promise<StartLoginResult> => {
     try {
       const authUrl = await controller.startLogin();

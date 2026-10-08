@@ -35,9 +35,8 @@ type ThreadResponse = {
   thread: { id: string };
 };
 
-type ReviewResponse = {
+type TurnResponse = {
   turn: { id: string };
-  reviewThreadId: string;
 };
 
 type CompletedTurn = {
@@ -51,6 +50,17 @@ export class CodexClientError extends Error {
     super(message);
     this.name = "CodexClientError";
   }
+}
+
+export function buildQuestionPrompt(question: string): string {
+  return [
+    "Answer a question about the current uncommitted changes in this Git worktree, in the context of the existing codebase.",
+    "Inspect the staged, unstaged, and non-ignored untracked changes. Read surrounding code and repository documentation as needed to give a precise, evidence-based answer.",
+    "This is an explanation-only task. Do not modify files or run write-capable commands. Answer the question directly and mention relevant file paths or symbols when useful.",
+    "",
+    "USER QUESTION (verbatim):",
+    question,
+  ].join("\n");
 }
 
 function unpackedPath(path: string): string {
@@ -191,7 +201,7 @@ export class CodexAppServer extends EventEmitter {
     });
   }
 
-  private async createReviewThread(root: string): Promise<string> {
+  private async createReadOnlyThread(root: string): Promise<string> {
     const response = await this.request<ThreadResponse>("thread/start", {
       cwd: root,
       approvalPolicy: "never",
@@ -215,16 +225,84 @@ export class CodexAppServer extends EventEmitter {
     if (signal.aborted) {
       throw new DOMException("Review superseded", "AbortError");
     }
-    const threadId = await this.createReviewThread(root);
+    const threadId = await this.createReadOnlyThread(root);
     if (signal.aborted) {
       throw new DOMException("Review superseded", "AbortError");
     }
 
+    return this.runTurn(
+      threadId,
+      signal,
+      "review/start",
+      {
+        threadId,
+        delivery: "inline",
+        target: { type: "uncommittedChanges" },
+      },
+      (item) =>
+        item?.type === "exitedReviewMode" ? (item.review ?? "") : null,
+      "Codex review failed.",
+    );
+  }
+
+  async answerQuestion(
+    root: string,
+    question: string,
+    signal: AbortSignal,
+  ): Promise<string> {
+    if (signal.aborted) {
+      throw new DOMException("Question superseded", "AbortError");
+    }
+    const threadId = await this.createReadOnlyThread(root);
+    if (signal.aborted) {
+      throw new DOMException("Question superseded", "AbortError");
+    }
+
+    return this.runTurn(
+      threadId,
+      signal,
+      "turn/start",
+      {
+        threadId,
+        input: [
+          {
+            type: "text",
+            text: buildQuestionPrompt(question),
+            text_elements: [],
+          },
+        ],
+        cwd: root,
+        approvalPolicy: "never",
+        approvalsReviewer: "user",
+        sandboxPolicy: {
+          type: "readOnly",
+          networkAccess: false,
+        },
+      },
+      (item) =>
+        item?.type === "agentMessage" && item.phase !== "commentary"
+          ? (item.text ?? "")
+          : null,
+      "Codex completed without returning an answer.",
+    );
+  }
+
+  private runTurn(
+    threadId: string,
+    signal: AbortSignal,
+    method: "review/start" | "turn/start",
+    params: JsonObject,
+    outputFromItem: (
+      item: { type?: string; review?: string; text?: string; phase?: string | null },
+    ) => string | null,
+    missingOutputMessage: string,
+  ): Promise<string> {
+
     let turnId: string | null = null;
-    let finalReview: string | null = null;
+    let finalOutput: string | null = null;
     let settled = false;
 
-    return new Promise<string>((resolveReview, rejectReview) => {
+    return new Promise<string>((resolveTurn, rejectTurn) => {
       const cleanup = () => {
         this.off("notification", onNotification);
         signal.removeEventListener("abort", onAbort);
@@ -245,33 +323,37 @@ export class CodexAppServer extends EventEmitter {
       };
       const onAbort = () => {
         void interrupt();
-        finish(() => rejectReview(new DOMException("Review superseded", "AbortError")));
+        finish(() => rejectTurn(new DOMException("Request superseded", "AbortError")));
       };
       const onNotification = (message: RpcMessage) => {
         if (message.params?.threadId !== threadId) return;
         if (message.method === "item/completed") {
           const item = message.params.item as
-            | { type?: string; review?: string }
+            | {
+                type?: string;
+                review?: string;
+                text?: string;
+                phase?: string | null;
+              }
             | undefined;
-          if (item?.type === "exitedReviewMode") {
-            finalReview = item.review ?? "";
-          }
+          const output = outputFromItem(item ?? {});
+          if (output !== null) finalOutput = output;
         }
         if (message.method === "turn/completed") {
           const turn = message.params.turn as CompletedTurn | undefined;
           if (!turn || (turnId && turn.id !== turnId)) return;
-          if (turn.status === "completed" && finalReview !== null) {
-            finish(() => resolveReview(finalReview as string));
+          if (turn.status === "completed" && finalOutput !== null) {
+            finish(() => resolveTurn(finalOutput as string));
             return;
           }
           if (turn.status === "interrupted") {
             finish(() =>
-              rejectReview(new DOMException("Review superseded", "AbortError")),
+              rejectTurn(new DOMException("Request superseded", "AbortError")),
             );
             return;
           }
-          const messageText = turn.error?.message ?? "Codex review failed.";
-          finish(() => rejectReview(new CodexClientError(messageText)));
+          const messageText = turn.error?.message ?? missingOutputMessage;
+          finish(() => rejectTurn(new CodexClientError(messageText)));
         }
       };
 
@@ -282,16 +364,12 @@ export class CodexAppServer extends EventEmitter {
         return;
       }
 
-      void this.request<ReviewResponse>("review/start", {
-        threadId,
-        delivery: "inline",
-        target: { type: "uncommittedChanges" },
-      })
+      void this.request<TurnResponse>(method, params)
         .then((response) => {
           turnId = response.turn.id;
           if (signal.aborted) void interrupt();
         })
-        .catch((error: Error) => finish(() => rejectReview(error)));
+        .catch((error: Error) => finish(() => rejectTurn(error)));
     });
   }
 

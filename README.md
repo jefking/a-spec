@@ -1,8 +1,8 @@
 # A-Spec
 
-A-Spec is a compact, read-only local code reviewer for Debian. Choose a Git worktree and it watches staged, unstaged, and non-ignored untracked changes. After the configurable quiet period, it asks Codex for feedback and appends the result to an in-memory Markdown timeline.
+A-Spec is a compact, read-only local code reviewer for Debian. Choose a Git worktree and it watches staged, unstaged, and non-ignored untracked changes. After the configurable quiet period, it asks Codex for feedback and appends the result to an in-memory Markdown timeline. You can also ask a one-shot question about the current changeset in the context of the surrounding codebase.
 
-There is no chat input, reply flow, or approval UI. Codex runs with `approvalPolicy: "never"`, a read-only sandbox, disabled web search and connectors, and an ephemeral thread for every review.
+Questions do not create a persistent chat or reply flow. Codex runs with `approvalPolicy: "never"`, a read-only sandbox, disabled web search and connectors, and an ephemeral thread for every review or answer.
 
 ## Run locally
 

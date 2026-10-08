@@ -33,6 +33,17 @@ input.on("line", line => {
     send({ method: "item/completed", params: { threadId: "review-thread", turnId: "turn-1", item: { type: "exitedReviewMode", id: "turn-1", review: "## Review\\n\\nLooks good." } } });
     send({ method: "turn/completed", params: { threadId: "review-thread", turn: { id: "turn-1", status: "completed", error: null } } });
   }
+  if (message.method === "turn/start") {
+    const prompt = message.params.input?.[0]?.text || "";
+    const isReadOnly = message.params.approvalPolicy === "never" && message.params.sandboxPolicy?.type === "readOnly" && message.params.sandboxPolicy?.networkAccess === false;
+    if (!prompt.includes("How does this affect existing callers?") || !prompt.includes("current uncommitted changes") || !isReadOnly) {
+      send({ id: message.id, error: { code: -32602, message: "question must include changeset context and remain read-only" } });
+    } else {
+      send({ id: message.id, result: { turn: { id: "turn-question" } } });
+      send({ method: "item/completed", params: { threadId: "review-thread", turnId: "turn-question", item: { type: "agentMessage", id: "answer-1", phase: "final_answer", text: "It preserves the existing caller contract." } } });
+      send({ method: "turn/completed", params: { threadId: "review-thread", turn: { id: "turn-question", status: "completed", error: null } } });
+    }
+  }
   if (message.method === "turn/interrupt") send({ id: message.id, result: {} });
 });
 `;
@@ -73,6 +84,20 @@ describe("Codex app-server client", () => {
     await expect(
       client.reviewUncommittedChanges("/tmp/repository", abort.signal),
     ).rejects.toMatchObject({ name: "AbortError" });
+    await client.stop();
+  });
+
+  it("answers a question with repository and changeset context in a read-only turn", async () => {
+    const runtime = await fakeCodex();
+    const client = new CodexAppServer(() => runtime);
+    await client.start();
+    await expect(
+      client.answerQuestion(
+        "/tmp/repository",
+        "How does this affect existing callers?",
+        new AbortController().signal,
+      ),
+    ).resolves.toBe("It preserves the existing caller contract.");
     await client.stop();
   });
 });

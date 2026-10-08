@@ -1,20 +1,22 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useState, type FormEvent } from "react";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import {
   DEFAULT_CADENCE_MS,
   MAX_CADENCE_MS,
+  MAX_QUESTION_LENGTH,
   MIN_CADENCE_MS,
   CADENCE_STEP_MS,
-  type ReviewEntry,
   type ReviewerState,
   type ReviewerStatus,
+  type TimelineEntry,
 } from "../shared/types";
 
 const CADENCE_STORAGE_KEY = "a-spec:cadence-ms";
 
 const initialState: ReviewerState = {
   repository: null,
+  currentSnapshot: null,
   cadenceMs: DEFAULT_CADENCE_MS,
   status: { type: "selecting" },
   entries: [],
@@ -45,7 +47,7 @@ function StatusCard({ status }: { status: ReviewerStatus }) {
     const remaining = Math.max(0, new Date(status.reviewAt).getTime() - now);
     detail = `${(remaining / 1_000).toFixed(1)}s`;
   }
-  if (status.type === "reviewing") {
+  if (status.type === "reviewing" || status.type === "answering") {
     detail = `${status.snapshot.fileCount} file${status.snapshot.fileCount === 1 ? "" : "s"}`;
   }
 
@@ -79,14 +81,15 @@ function MarkdownReview({ markdown }: { markdown: string }) {
   );
 }
 
-function ReviewCard({ entry, sequence }: { entry: ReviewEntry; sequence: number }) {
+function TimelineCard({ entry, sequence }: { entry: TimelineEntry; sequence: number }) {
   const visibleFiles = entry.snapshot.files.slice(0, 4);
   const hiddenCount = entry.snapshot.files.length - visibleFiles.length;
+  const label = entry.kind === "answer" ? "ANSWER" : "REVIEW";
   return (
-    <article className="review-card">
+    <article className={`review-card entry-${entry.kind}`}>
       <header className="review-header">
         <div>
-          <span className="review-number">REVIEW {String(sequence).padStart(2, "0")}</span>
+          <span className="review-number">{label} {String(sequence).padStart(2, "0")}</span>
           <h2>{formatClock(entry.completedAt)}</h2>
         </div>
         <div className="diff-stat" aria-label="Diff statistics">
@@ -109,6 +112,12 @@ function ReviewCard({ entry, sequence }: { entry: ReviewEntry; sequence: number 
         ))}
         {hiddenCount > 0 && <span className="file-pill more">+{hiddenCount} more</span>}
       </div>
+      {entry.kind === "answer" && (
+        <div className="question-copy">
+          <span>QUESTION</span>
+          <p>{entry.question}</p>
+        </div>
+      )}
       <MarkdownReview markdown={entry.markdown} />
     </article>
   );
@@ -118,6 +127,8 @@ export function App() {
   const [state, setState] = useState(initialState);
   const [selectionError, setSelectionError] = useState<string | null>(null);
   const [loginError, setLoginError] = useState<string | null>(null);
+  const [question, setQuestion] = useState("");
+  const [questionError, setQuestionError] = useState<string | null>(null);
 
   useEffect(() => {
     const unsubscribe = window.reviewer.subscribeReviewerState(setState);
@@ -161,6 +172,17 @@ export function App() {
     localStorage.setItem(CADENCE_STORAGE_KEY, String(cadence));
   }
 
+  async function askQuestion(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    setQuestionError(null);
+    const result = await window.reviewer.askQuestion(question);
+    if (result.ok) {
+      setQuestion("");
+    } else {
+      setQuestionError(result.message);
+    }
+  }
+
   if (!state.repository) {
     return (
       <main className="onboarding-shell">
@@ -184,6 +206,22 @@ export function App() {
   const authStatus =
     state.status.type === "auth-required" ? state.status : null;
   const isAuthRequired = authStatus !== null;
+  const questionBusy =
+    state.status.type === "reviewing" || state.status.type === "answering";
+  const canAsk = Boolean(
+    state.currentSnapshot &&
+      !isAuthRequired &&
+      !questionBusy &&
+      state.status.type !== "connecting" &&
+      state.status.type !== "error",
+  );
+  const questionHint = !state.currentSnapshot
+    ? "Make a local change to ask about its place in the codebase."
+    : isAuthRequired
+      ? "Sign in to ask Codex about this snapshot."
+      : questionBusy
+        ? "Codex is already working on this snapshot."
+        : "Codex can inspect the current diff and surrounding repository files, but cannot modify them.";
   return (
     <div className="app-shell">
       <header className="topbar">
@@ -247,6 +285,47 @@ export function App() {
           </section>
         )}
 
+        <section className="question-panel">
+          <div className="question-heading">
+            <div>
+              <p className="eyebrow">ASK THIS CHANGESET</p>
+              <h2>Question the diff in context.</h2>
+            </div>
+            {state.currentSnapshot && (
+              <code>{shortId(state.currentSnapshot.id)}</code>
+            )}
+          </div>
+          <form onSubmit={(event) => void askQuestion(event)}>
+            <label className="sr-only" htmlFor="changeset-question">
+              Question about the current changes
+            </label>
+            <textarea
+              id="changeset-question"
+              value={question}
+              maxLength={MAX_QUESTION_LENGTH}
+              rows={3}
+              disabled={!canAsk}
+              aria-describedby="question-hint"
+              placeholder="What do these changes do, and how do they fit into the existing design?"
+              onChange={(event) => setQuestion(event.target.value)}
+            />
+            <div className="question-actions">
+              <p id="question-hint">{questionHint}</p>
+              <div>
+                <span>{question.length}/{MAX_QUESTION_LENGTH}</span>
+                <button
+                  className="primary-button compact"
+                  type="submit"
+                  disabled={!canAsk || question.trim().length === 0}
+                >
+                  {state.status.type === "answering" ? "Answering…" : "Ask Codex"}
+                </button>
+              </div>
+            </div>
+          </form>
+          {questionError && <p className="inline-error" role="alert">{questionError}</p>}
+        </section>
+
         <section className="timeline" aria-label="Review timeline">
           {state.entries.length > 0 && (
             <div className="timeline-heading">
@@ -255,7 +334,7 @@ export function App() {
             </div>
           )}
           {newestEntries.map((entry, index) => (
-            <ReviewCard
+            <TimelineCard
               key={entry.id}
               entry={entry}
               sequence={state.entries.length - index}
@@ -264,7 +343,7 @@ export function App() {
           {state.entries.length === 0 && !isAuthRequired && (
             <div className="empty-timeline">
               <div className="empty-glyph">⌁</div>
-              <p>Completed reviews will collect here for this session.</p>
+              <p>Completed reviews and answers will collect here for this session.</p>
             </div>
           )}
         </section>

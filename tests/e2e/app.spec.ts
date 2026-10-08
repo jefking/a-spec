@@ -7,7 +7,7 @@ import { promisify } from "node:util";
 
 const execFileAsync = promisify(execFile);
 
-test("selects a Git directory and exposes no chat interaction", async () => {
+test("selects a Git directory and exposes the read-only question composer", async () => {
   const repository = await mkdtemp(join(tmpdir(), "a-spec-e2e-"));
   await execFileAsync("git", ["-C", repository, "init", "-q"]);
   const {
@@ -34,7 +34,10 @@ test("selects a Git directory and exposes no chat interaction", async () => {
     await expect(page.getByText(repository)).toBeVisible();
     await expect(page.getByRole("slider", { name: /review cadence/i })).toBeVisible();
     await expect(page.getByText(/read only/i).first()).toBeVisible();
-    await expect(page.locator("textarea, input[type='text']")).toHaveCount(0);
+    await expect(
+      page.getByRole("textbox", { name: /question about the current changes/i }),
+    ).toBeVisible();
+    await expect(page.getByRole("button", { name: /ask codex/i })).toBeDisabled();
     await expect(page.getByRole("button", { name: /^review$/i })).toHaveCount(0);
   } finally {
     await application.close();

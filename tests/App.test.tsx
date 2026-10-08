@@ -1,5 +1,5 @@
-import { render, screen, waitFor } from "@testing-library/react";
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { App } from "../src/renderer/App";
 import type { ReviewerApi, ReviewerState } from "../src/shared/types";
 
@@ -9,6 +9,7 @@ function installReviewer(state: ReviewerState) {
     changeRepository: vi.fn(async () => ({ ok: false, cancelled: true })),
     setCadenceMs: vi.fn(async (milliseconds) => milliseconds),
     startLogin: vi.fn(async () => ({ ok: true as const })),
+    askQuestion: vi.fn(async () => ({ ok: true as const })),
     subscribeReviewerState: vi.fn((listener) => {
       listener(state);
       return () => undefined;
@@ -19,11 +20,13 @@ function installReviewer(state: ReviewerState) {
 }
 
 beforeEach(() => localStorage.clear());
+afterEach(cleanup);
 
 describe("A-Spec renderer", () => {
   it("starts with directory selection and no chat controls", () => {
     installReviewer({
       repository: null,
+      currentSnapshot: null,
       cadenceMs: 2_000,
       status: { type: "selecting" },
       entries: [],
@@ -33,7 +36,17 @@ describe("A-Spec renderer", () => {
     expect(screen.queryByRole("textbox")).not.toBeInTheDocument();
   });
 
-  it("renders review Markdown but not raw HTML or remote images", async () => {
+  it("renders review Markdown safely and exposes changeset questions", async () => {
+    const snapshot = {
+      id: "0123456789",
+      branch: "main",
+      head: "abc123",
+      files: [{ path: "src/example.ts", status: ".M" }],
+      fileCount: 1,
+      additions: 2,
+      deletions: 1,
+      capturedAt: "2026-01-01T12:00:00.000Z",
+    };
     installReviewer({
       repository: {
         root: "/work/example",
@@ -41,25 +54,18 @@ describe("A-Spec renderer", () => {
         branch: "main",
         head: "abc123",
       },
+      currentSnapshot: snapshot,
       cadenceMs: 2_000,
       status: { type: "watching", message: "Watching" },
       entries: [
         {
           id: "review-1",
+          kind: "review",
           startedAt: "2026-01-01T12:00:00.000Z",
           completedAt: "2026-01-01T12:00:01.000Z",
           markdown:
             "## Finding\n\n`safe()` needs a guard.\n\n<img src=x onerror=alert(1)>\n\n![remote](https://example.com/x.png)",
-          snapshot: {
-            id: "0123456789",
-            branch: "main",
-            head: "abc123",
-            files: [{ path: "src/example.ts", status: ".M" }],
-            fileCount: 1,
-            additions: 2,
-            deletions: 1,
-            capturedAt: "2026-01-01T12:00:00.000Z",
-          },
+          snapshot,
         },
       ],
     });
@@ -67,7 +73,8 @@ describe("A-Spec renderer", () => {
     expect(await screen.findByRole("heading", { name: "Finding" })).toBeVisible();
     expect(container.querySelector("img")).toBeNull();
     expect(container.querySelector("[onerror]")).toBeNull();
-    expect(screen.queryByRole("textbox")).not.toBeInTheDocument();
+    expect(screen.getByRole("textbox", { name: /question about the current changes/i })).toBeVisible();
+    expect(screen.getByRole("button", { name: /ask codex/i })).toBeDisabled();
     expect(screen.queryByRole("button", { name: /^review$/i })).not.toBeInTheDocument();
   });
 
@@ -89,11 +96,13 @@ describe("A-Spec renderer", () => {
         branch: "main",
         head: "abc123",
       },
+      currentSnapshot: snapshot,
       cadenceMs: 2_000,
       status: { type: "watching", message: "Watching" },
       entries: [
         {
           id: "review-1",
+          kind: "review",
           startedAt: "2026-01-01T12:00:00.000Z",
           completedAt: "2026-01-01T12:00:01.000Z",
           markdown: "Earlier review",
@@ -101,6 +110,7 @@ describe("A-Spec renderer", () => {
         },
         {
           id: "review-2",
+          kind: "review",
           startedAt: "2026-01-01T12:01:00.000Z",
           completedAt: "2026-01-01T12:01:01.000Z",
           markdown: "Latest review",
@@ -118,9 +128,58 @@ describe("A-Spec renderer", () => {
     expect(cards[1]).toHaveTextContent("Earlier review");
   });
 
+  it("submits a question and renders completed answers in the timeline", async () => {
+    const snapshot = {
+      id: "0123456789",
+      branch: "main",
+      head: "abc123",
+      files: [{ path: "src/example.ts", status: ".M" }],
+      fileCount: 1,
+      additions: 2,
+      deletions: 1,
+      capturedAt: "2026-01-01T12:00:00.000Z",
+    };
+    const api = installReviewer({
+      repository: {
+        root: "/work/example",
+        name: "example",
+        branch: "main",
+        head: "abc123",
+      },
+      currentSnapshot: snapshot,
+      cadenceMs: 2_000,
+      status: { type: "watching", message: "Watching" },
+      entries: [
+        {
+          id: "answer-1",
+          kind: "answer",
+          question: "Why is this guard needed?",
+          startedAt: "2026-01-01T12:00:00.000Z",
+          completedAt: "2026-01-01T12:00:01.000Z",
+          markdown: "It protects the existing caller in `src/caller.ts`.",
+          snapshot,
+        },
+      ],
+    });
+    render(<App />);
+
+    expect(screen.getByText("Why is this guard needed?")).toBeVisible();
+    expect(screen.getByText(/protects the existing caller/)).toBeVisible();
+    const input = screen.getByRole("textbox", {
+      name: /question about the current changes/i,
+    });
+    fireEvent.change(input, { target: { value: "How does this affect callers?" } });
+    fireEvent.click(screen.getByRole("button", { name: /ask codex/i }));
+
+    await waitFor(() =>
+      expect(api.askQuestion).toHaveBeenCalledWith("How does this affect callers?"),
+    );
+  });
+
   it("persists only the cadence preference", async () => {
     const api = installReviewer({
       repository: null,
+      currentSnapshot: null,
       cadenceMs: 2_000,
       status: { type: "selecting" },
       entries: [],

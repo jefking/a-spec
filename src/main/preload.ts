@@ -1,5 +1,6 @@
 import { contextBridge, ipcRenderer } from "electron";
 import type {
+  AskQuestionResult,
   ReviewerApi,
   ReviewerState,
   SelectRepositoryResult,
@@ -15,6 +16,11 @@ const api: ReviewerApi = {
     ipcRenderer.invoke("reviewer:set-cadence", milliseconds) as Promise<number>,
   startLogin: () =>
     ipcRenderer.invoke("reviewer:start-login") as Promise<StartLoginResult>,
+  askQuestion: (question) =>
+    ipcRenderer.invoke(
+      "reviewer:ask-question",
+      question,
+    ) as Promise<AskQuestionResult>,
   subscribeReviewerState: (listener) => {
     let active = true;
     const receive = (_event: Electron.IpcRendererEvent, state: ReviewerState) => {
